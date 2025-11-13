@@ -42,21 +42,44 @@ func (r *Repository) Add(ctx context.Context,
 			return nil, fault.New("email address already claimed", fctx.With(ctx), ftag.With(ftag.AlreadyExists))
 		}
 
-		// Already claimed by this account, update the record
-		update := r.db.Email.UpdateOne(existing).
-			Where(email_ent.EmailAddress(email.Address)).
-			SetVerificationCode(code)
+		// Already claimed by this account
+		if existing.AccountID != nil && *existing.AccountID == xid.ID(accountID) {
+			// If email is already verified for this account, don't allow re-adding
+			if existing.Verified {
+				return nil, fault.New("email address already exists and is verified", 
+					fctx.With(ctx), 
+					ftag.With(ftag.AlreadyExists),
+				)
+			}
 
+			// Email exists for this account but not verified, update verification code
+			update := r.db.Email.UpdateOne(existing).
+				Where(email_ent.EmailAddress(email.Address)).
+				SetVerificationCode(code)
+
+			updated, err := update.Save(ctx)
+			if err != nil {
+				return nil, fault.Wrap(err, fctx.With(ctx))
+			}
+
+			return account.MapEmail(updated), nil
+		}
+
+		// Email exists but not claimed (AccountID is nil), claim it for this account
 		if existing.AccountID == nil {
-			update.SetAccountID(xid.ID(accountID))
-		}
+			update := r.db.Email.UpdateOne(existing).
+				Where(email_ent.EmailAddress(email.Address)).
+				SetAccountID(xid.ID(accountID)).
+				SetVerificationCode(code).
+				SetVerified(false)
 
-		updated, err := update.Save(ctx)
-		if err != nil {
-			return nil, fault.Wrap(err, fctx.With(ctx))
-		}
+			updated, err := update.Save(ctx)
+			if err != nil {
+				return nil, fault.Wrap(err, fctx.With(ctx))
+			}
 
-		return account.MapEmail(updated), nil
+			return account.MapEmail(updated), nil
+		}
 	}
 
 	// Does not exist, create a new email record, bind to owner.
@@ -119,12 +142,24 @@ func (r *Repository) LookupCode(ctx context.Context, emailAddress mail.Address, 
 }
 
 func (r *Repository) Verify(ctx context.Context, accountID account.AccountID, email mail.Address) error {
-	_, err := r.db.Email.Update().
-		Where(email_ent.EmailAddress(email.Address)).
+	// Verify email ownership before marking as verified
+	result, err := r.db.Email.Update().
+		Where(
+			email_ent.EmailAddress(email.Address),
+			email_ent.HasAccountWith(account_ent.ID(xid.ID(accountID))),
+		).
 		SetVerified(true).
 		Save(ctx)
 	if err != nil {
 		return fault.Wrap(err, fctx.With(ctx))
+	}
+
+	// If no rows were updated, email doesn't belong to this account
+	if result == 0 {
+		return fault.New("email address not found for this account",
+			fctx.With(ctx),
+			ftag.With(ftag.NotFound),
+		)
 	}
 
 	return nil
